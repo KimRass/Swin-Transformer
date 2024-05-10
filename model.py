@@ -1,4 +1,6 @@
-# Reference: https://github.com/berniwal/swin-transformer-pytorch/blob/master/swin_transformer_pytorch/swin_transformer.py
+# References:
+    # https://github.com/berniwal/swin-transformer-pytorch/blob/master/swin_transformer_pytorch/swin_transformer.py
+    # https://pajamacoder.tistory.com/18
 
 import torch
 import torch.nn as nn
@@ -72,9 +74,10 @@ class MSA(nn.Module):
         q = self.q_proj(q) # "$hwC^{2}$"
         k = self.k_proj(k) # "$hwC^{2}$"
         v = self.v_proj(v) # "$hwC^{2}$"
+        # "$(hw)^{2}C$" or "${M^{2}}^{2}(\frac{h}{M})(\frac{w}{M})C$"
         attn_score = torch.einsum(
             "binh,bjnh->bnij", self.to_multi_heads(q), self.to_multi_heads(k),
-        ) * self.scale # "$(hw)^{2}C$"
+        ) * self.scale
         if mask is not None:
             attn_score.masked_fill_(
                 mask=einops.repeat(
@@ -83,26 +86,31 @@ class MSA(nn.Module):
                 value=-1e9,
             )
         attn_weight = F.softmax(attn_score, dim=-1)
+        # "$(hw)^{2}C$" or "${M^{2}}^{2}(\frac{h}{M})(\frac{w}{M})C$"
         x = self.to_one_head(
             torch.einsum(
                 "bnij,bjnh->binh",
                 self.attn_drop(attn_weight),
                 self.to_multi_heads(v),
             )
-        ) # "$(hw)^{2}C$"
+        )
         x = self.out_proj(x) # "$hwC^{2}$"
         return x, attn_weight
-# (1, 56 ** 2, 768) / (64, 49, 768)
-14 ** 2
-7 ** 2 * 4
+
 
 class WMSA(MSA):
+    """
+    "To make the window size (M;M) divisible by the feature map size of
+    (h;w), bottom-right padding is employed on the feature map if needed."
+    """
     def __init__(self, window_size, hidden_dim, num_heads, drop_prob):
         super().__init__(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             drop_prob=drop_prob,
         )
+
+        self.window_size = window_size
 
         self.spat_to_batch = Rearrange(
             pattern="b c (M1 h) (M2 w) -> (b h w) (M1 M2) c",
@@ -112,16 +120,14 @@ class WMSA(MSA):
 
     def forward(self, x):
         _, _, h, w = x.shape
-        print(x.shape)
         x = self.spat_to_batch(x)
-        print(x.shape)
         x, _ = super().forward(q=x, k=x, v=x)
         return einops.rearrange(
             x,
             pattern="(b h w) (M1 M2) c -> b c (M1 h) (M2 w)",
-            M1=window_size,
-            h=h // window_size,
-            w=w // window_size,
+            M1=self.window_size,
+            h=h // self.window_size,
+            w=w // self.window_size,
         )
 
 
@@ -129,18 +135,57 @@ class SWMSA(nn.Module):
     """
     "the next module adopts a windowing configuration that is shifted from that of the preceding layer, by displacing the windows by (bM 2 c; bM 2 c) pixels from the regularly partitioned windows."
     """
-    def __init__(self):
+    def __init__(self, window_size,):
         super().__init__()
+        
+        self.for_cyc_shift = CyclicShift(disp=-window_size // 2)
+        self.back_cyc_shift = CyclicShift(disp=window_size // 2)
+
+    def forward(self, x):
+        _, _, h, w = x.shape
+        x = self.for_cyc_shift(x)
+        x = self.spat_to_batch(x)
+        x, _ = super().forward(q=x, k=x, v=x)
+    
+    """
+    "window. Since the relative position along each axis lies in the range [􀀀M +1;M 􀀀1], we parameterize a smaller-sized bias matrix ^B 2 R(2M􀀀1) (2M􀀀1), and values in B are taken from ^B ."
+    "The learnt relative position bias in pre-training can be also used to initialize a model for fine-tuning with a different window size through bi-cubic interpolation [20, 63]."
+    """
+
+def get_relative_distances(window_size):
+    import numpy as np
+    indices = torch.tensor(np.array([[x, y] for x in range(window_size) for y in range(window_size)]))
+    indices
+    distances = indices[None, :, :] - indices[:, None, :]
+    return distances
+
+window_size = 4
+get_relative_distances(window_size)[..., 0]
+get_relative_distances(window_size)[..., 1]
+bias_mat = torch.randn((window_size * 2 - 1, window_size * 2 - 1))
+bias_mat.shape
+bias_mat[:, ]
+
+
+idx = torch.arange(window_size)
+rel_pos = idx[None, :] - idx[:, None]
+rel_pos
+
+bias_mat.shape, rel_pos.shape
+
+bias_mat
+rel_pos
 
 
 class SwinTransformerBlock(nn.Module):
     def __init__(
         self,
+        window_size,
         hidden_dim,
         num_heads,
         mlp_dim,
         attn_drop_prob,
-        ff_drop_prob,
+        mlp_drop_prob,
         res_drop_prob,
     ):
         super().__init__()
@@ -149,66 +194,33 @@ class SwinTransformerBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
 
-        self.self_attn = WMSA(
-            hidden_dim=hidden_dim, num_heads=num_heads, drop_prob=attn_drop_prob,
+        self.msa = WMSA(
+            window_size=window_size,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            drop_prob=attn_drop_prob,
         )
-        self.feed_forward = MLP(
+        self.mlp = MLP(
             hidden_dim=hidden_dim,
             mlp_dim=mlp_dim,
-            drop_prob=ff_drop_prob,
+            drop_prob=mlp_drop_prob,
             activ="relu",
         )
 
-        self.self_attn_res_conn = ResidualConnection(
-            fn=lambda x, mask: self.self_attn(q=x, k=x, v=x, mask=mask)[0],
+        self.msa_res_conn = ResidualConnection(
+            fn=lambda x, mask: self.msa(q=x, k=x, v=x, mask=mask)[0],
             hidden_dim=hidden_dim,
             drop_prob=attn_drop_prob,
         )
-        self.ff_res_conn = ResidualConnection(
-            fn=self.feed_forward,
+        self.mlp_res_conn = ResidualConnection(
+            fn=self.mlp,
             hidden_dim=hidden_dim,
             drop_prob=res_drop_prob,
         )
 
     def forward(self, x, mask=None):
-        x = self.self_attn_res_conn(skip=x, x=x, mask=mask)
-        return self.ff_res_conn(skip=x, x=x)
-
-
-# class SwinTransformerBlock(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         patch_dim = 3
-
-#         # self.ln1 = nn.LayerNorm(patch_dim)
-#         # self.wmsa = WMSA()
-#         # self.ln2 = nn.LayerNorm(hidden_dim)
-#         # self.mlp = MLP(dim=)
-#         # self.swmsa = SWMSA()
-#         self.sequential1 = nn.Sequential(
-#             nn.LayerNorm(patch_dim),
-#             WMSA()
-#         )
-#         self.residual_connection1 = ResidualConnection(fn=self.sequential1)
-
-#         self.sequential2 = nn.Sequential(
-#             nn.LayerNorm(patch_dim),
-#             SWMSA()
-#         )
-#         self.residual_connection2 = ResidualConnection(fn=self.sequential2)
-
-#         self.sequential3 = nn.Sequential(
-#             nn.LayerNorm(patch_dim),
-#             MLP()
-#         )
-#         self.residual_connection3 = ResidualConnection(fn=self.sequential3)
-    
-#     def forward(self, x):
-#         x = self.residual_connection1(x)
-#         x = self.residual_connection3(x)
-#         x = self.residual_connection2(x)
-#         x = self.residual_connection3(x)
-#         return x
+        x = self.msa_res_conn(skip=x, x=x, mask=mask)
+        return self.mlp_res_conn(skip=x, x=x)
 
 
 class PatchPartition(nn.Module):
@@ -235,61 +247,13 @@ class PatchPartition(nn.Module):
 
 
 class PatchMerging(nn.Module):
-    def __init__(self, downscaling_factor, hidden_dim=96):
+    def __init__(self, hidden_dim):
         super().__init__()
 
-        self.downscaling_factor = downscaling_factor
-
-        self.unfold = nn.Unfold(kernel_size=downscaling_factor, stride=downscaling_factor, padding=0)
-        self.linear = nn.Linear(4 * hidden_dim, 2 * hidden_dim)
+        self.conv = nn.Conv2d(hidden_dim, 2 * hidden_dim, 2, 2, 0)
     
     def forward(self, x):
-        # x = x
-        # x.shape
-        b, c, h, w = x.shape
-
-        new_h = h // self.downscaling_factor
-        new_w = w // self.downscaling_factor
-        x = self.unfold(x)
-        x = x.view((b, -1, new_h, new_w))
-        x = x.permute((0, 2, 3, 1))
-        x = self.linear(x)
-        x = x.permute((0, 3, 1, 2))
-        return x
-
-    # def __init__(self, downscaling_factor, hidden_dim=96):
-    #     super().__init__()
-
-    # def forward(self, x):
-    #     x = x
-    #     downscaling_factor=2
-        
-    #     b, h, w, c = x.shape
-
-    #     x = x.permute((0, 3, 1, 2))
-        
-    #     b, c, h, w = x.shape
-    #     x.shape
-    #     # (4, 96, 43, 70)
-
-    #     new_h = h // downscaling_factor
-    #     new_w = w // downscaling_factor
-    #     unfold = nn.Unfold(kernel_size=downscaling_factor, stride=downscaling_factor, padding=0)
-    #     unfold(x).shape
-    #     unfold(x).view((b, -1, new_h, new_w)).shape
-    #     96*4
-
-        
-    #     1680 / hidden_dim / 4
-    #     1680 / 96
-    #     h
-    #     new_h
-    #     4 * new_h * new_w
-        
-    #     4*172*1680 / 2940
-    #     unfold(x).view((b, new_h, new_w, -1))
-    #     shape
-
+        return self.conv(x)
 
 
 class SwinTransformer(nn.Module):
@@ -334,18 +298,18 @@ class SwinTransformer(nn.Module):
 
 
 if __name__ == "__main__":
-    # model = SwinTransformer(num_classes=100)
-    # image = torch.randn((4, 3, 512, 512))
-    # model(image).shape
+    model = SwinTransformer(num_classes=100)
+    image = torch.randn((4, 3, 512, 512))
+    model(image).shape
     # model
-    
-    window_size=7
-    wmsa = WMSA(
-        window_size=window_size,
-        hidden_dim=768,
-        num_heads=2,
-        drop_prob=0.1,
-    )
-    x = torch.randn((1, 768, 56, 56)) # (4 * 8 * 8, 768, 7 * 7)
-    wmsa(x).shape
-    56 ** 2
+
+    # window_size=7
+    # wmsa = WMSA(
+    #     window_size=window_size,
+    #     hidden_dim=768,
+    #     num_heads=2,
+    #     drop_prob=0.1,
+    # )
+    # x = torch.randn((1, 768, 56, 56)) # (4 * 8 * 8, 768, 7 * 7)
+    # wmsa(x).shape
+    # 56 ** 2
