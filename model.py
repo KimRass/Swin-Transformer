@@ -1,12 +1,15 @@
 # References:
     # https://github.com/berniwal/swin-transformer-pytorch/blob/master/swin_transformer_pytorch/swin_transformer.py
     # https://pajamacoder.tistory.com/18
+    # https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
 from einops.layers.torch import Rearrange
+import math
+from torchvision.models import swin_t
 
 
 class CyclicShift(nn.Module):
@@ -45,12 +48,21 @@ class WMSA(nn.Module):
     """
     "To make the window size (M;M) divisible by the feature map size of
     (h;w), bottom-right padding is employed on the feature map if needed."
+    "To make the window size (M, M) divisible by the feature map size of (h, w),
+    bottom-right padding is employed on the feature map if needed."
     """
     def get_rel_pos_bias(self, window_size):
         """
-        "$Attention(Q;K; V ) = SoftMax(QKT = p d + B)V;$"
-        "Since the relative position along each axis lies in the range [􀀀M +1;M 􀀀1], we parameterize a smaller-sized bias matrix ^B 2 R(2M􀀀1) (2M􀀀1), and values in B are taken from ^B ."
-        "The learnt relative position bias in pre-training can be also used to initialize a model for fine-tuning with a different window size through bi-cubic interpolation [20, 63]."
+        "A relative position bias $B \in \mathbb{R}^{M^{2} \times M^{2}}$ to
+        each head in computing similarity:
+        $\text{Attention}(Q, K, V) = \text{SoftMax}(QK^{T}/\sqrt{d} + B)V$"
+        "Since the relative position along each axis lies in the range
+        $[-M + 1, M - 1]$, we parameterize a smaller-sized bias matrix
+        $\hat{B} \in \mathbb{R}^{(2M - 1) \times (2M - 1)}$, and values in B are
+        taken from $\hat{B}$."
+        "The learnt relative position bias in pre-training can be also used to
+        initialize a model for fine-tuning with a different window size through
+        bi-cubic interpolation."
         """
         self.bias_mat = nn.Parameter(
             torch.randn((window_size * 2 - 1, window_size * 2 - 1))
@@ -64,14 +76,18 @@ class WMSA(nn.Module):
     def __init__(self, window_size, hidden_dim, head_dim, drop_prob):
         super().__init__()
 
-        self.num_heads = hidden_dim // head_dim
         self.window_size = window_size
+        self.hidden_dim = hidden_dim
+        self.head_dim = head_dim
+        self.num_heads = hidden_dim // head_dim
 
-        self.window_to_seq = Rearrange(
-            pattern="b c (M1 h) (M2 w) -> (b h w) (M1 M2) c",
-            M1=window_size,
-            M2=window_size,
-        )
+        self.window_to_seq = nn.Sequential(
+            Rearrange(
+                pattern="b c (M1 h) (M2 w) -> (b h w) (M1 M2) c",
+                M1=window_size,
+                M2=window_size,
+            )
+        )       
         self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -95,7 +111,6 @@ class WMSA(nn.Module):
         attn_score = torch.einsum(
             "binh,bjnh->bnij", self.to_multi_heads(q), self.to_multi_heads(k),
         ) * self.scale
-        # attn_score += self.rel_pos_bias
         attn_score += einops.repeat(
             self.rel_pos_bias,
             pattern="h w -> b c h w",
@@ -128,20 +143,31 @@ class WMSA(nn.Module):
         )
         return x, attn_weight
 
+    def get_flops(self, seq_len):
+        flops = 0
+        flops += self.hidden_dim * self.hidden_dim * seq_len * 3
+        flops += self.num_heads * seq_len * seq_len * self.head_dim
+        flops += seq_len * self.num_heads * self.head_dim * seq_len
+        flops += self.hidden_dim * self.hidden_dim * seq_len
+        return flops
+
 
 class SWMSA(nn.Module):
     """
-    "the next module adopts a windowing configuration that is shifted from that of the preceding layer, by displacing the windows by (bM 2 c; bM 2 c) pixels from the regularly partitioned windows."
+    "The next module adopts a windowing configuration that is shifted from that
+    of the preceding layer, by displacing the windows by
+    $(\lfloor \frac{M}{2} \rfloor, \lfloor \frac{M}{2} \rfloor)$ pixels from the
+    regularly partitioned windows."
     """
     def __init__(self, window_size,):
         super().__init__()
         
-        self.for_cyc_shift = CyclicShift(disp=-window_size // 2)
-        self.back_cyc_shift = CyclicShift(disp=window_size // 2)
+        self.cyc_shift = CyclicShift(disp=-window_size // 2)
+        self.rev_cyc_shift = CyclicShift(disp=window_size // 2)
 
     def forward(self, x):
         _, _, h, w = x.shape
-        x = self.for_cyc_shift(x)
+        x = self.cyc_shift(x)
         x = self.window_to_seq(x)
         x, _ = super().forward(q=x, k=x, v=x)
 
@@ -155,9 +181,11 @@ class SwinTransformerBlock(nn.Module):
         exp_rate,
         attn_drop_prob,
         mlp_drop_prob,
-        res_drop_prob,
+        # res_drop_prob,
     ):
         super().__init__()
+
+        self.window_size = window_size
 
         self.msa_ln = nn.LayerNorm(hidden_dim)
         self.msa = WMSA(
@@ -174,6 +202,19 @@ class SwinTransformerBlock(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        _, _, h, w = x.shape
+        x = F.pad(
+            x,
+            pad=(
+                0,
+                math.ceil(w / self.window_size) * self.window_size - w,
+                0,
+                math.ceil(h / self.window_size) * self.window_size - h
+            ),
+            mode="constant",
+            value=0,
+        )
+
         skip = x
         x = x.permute((0, 2, 3, 1))
         x = self.msa_ln(x)
@@ -214,10 +255,10 @@ class PatchPartition(nn.Module):
 
 
 class PatchMerging(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, hidden_dim):
         super().__init__()
 
-        self.conv = nn.Conv2d(channels, channels * 2, 2, 2, 0)
+        self.conv = nn.Conv2d(hidden_dim, hidden_dim * 2, 2, 2, 0)
     
     def forward(self, x):
         return self.conv(x)
@@ -230,28 +271,27 @@ class SwinTransformer(nn.Module):
     "The Transformer blocks maintain the number of tokens (H 4   W 4 ), and together with the linear embedding are referred to as 'Stage 1'".
     "The first patch merging layer concatenates the features of each group of 2   2 neighboring patches, and applies a linear layer on the 4C-dimensional concatenated features. This reduces the number of tokens by a multiple of 2 2 = 4 (2  downsampling of resolution), and the output dimension is set to 2C."
     "The window size is set to M = 7 by default. The query dimension of each head is d = 32, and the expansion layer of each MLP is   = 4"
+    "The image classification is performed by applying a global average pooling
+    layer on the output feature map of the last stage, followed by a linear
+    classifier."
     """
-    # `window_size`: $M$
-    # `hidden_dim`: $C$
     def __init__(
         self,
-        num_classes,
+        num_classes=None,
         patch_size=4,
-        hidden_dim=96,
+        hidden_dim=96, # $C$
         num_layers=(2, 2, 6, 2),
-        # window_size=7,
-        window_size=4,
+        window_size=7, # $M$
         head_dim=32,
         exp_rate=4,
         attn_drop_prob=0.1,
         mlp_drop_prob=0.1,
-        res_drop_prob=0.1,
+        # res_drop_prob=0.1,
     ):
         super().__init__()
 
-        # window_size=7
-        # patch_size=4
-        # hidden_dim=96
+        self.num_classes = num_classes
+
         self.patch_part = PatchPartition(patch_size=patch_size)
         self.stage1 = nn.Sequential(
             nn.Conv2d(
@@ -265,7 +305,7 @@ class SwinTransformer(nn.Module):
                     exp_rate=exp_rate,
                     attn_drop_prob=attn_drop_prob,
                     mlp_drop_prob=mlp_drop_prob,
-                    res_drop_prob=res_drop_prob,
+                    # res_drop_prob=res_drop_prob,
                 )
             ] * num_layers[0]
         )
@@ -279,7 +319,7 @@ class SwinTransformer(nn.Module):
                     exp_rate=exp_rate,
                     attn_drop_prob=attn_drop_prob,
                     mlp_drop_prob=mlp_drop_prob,
-                    res_drop_prob=res_drop_prob,
+                    # res_drop_prob=res_drop_prob,
                 )
             ] * num_layers[1]
         )
@@ -293,7 +333,7 @@ class SwinTransformer(nn.Module):
                     exp_rate=exp_rate,
                     attn_drop_prob=attn_drop_prob,
                     mlp_drop_prob=mlp_drop_prob,
-                    res_drop_prob=res_drop_prob,
+                    # res_drop_prob=res_drop_prob,
                 )
             ] * num_layers[2]
         )
@@ -307,10 +347,16 @@ class SwinTransformer(nn.Module):
                     exp_rate=exp_rate,
                     attn_drop_prob=attn_drop_prob,
                     mlp_drop_prob=mlp_drop_prob,
-                    res_drop_prob=res_drop_prob,
+                    # res_drop_prob=res_drop_prob,
                 )
             ] * num_layers[3]
         )
+        if num_classes is not None:
+            self.cls_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(hidden_dim * 8, num_classes),
+            )
 
     def forward(self, image):
         x = self.patch_part(image)
@@ -318,10 +364,78 @@ class SwinTransformer(nn.Module):
         x = self.stage2(x)
         x = self.stage3(x)
         x = self.stage4(x)
+        if self.num_classes is not None:
+            x = self.cls_head(x)
         return x
+
+
+class SwinT(SwinTransformer):
+    def __init__(self, num_classes=None):
+        super().__init__(
+            num_classes=num_classes,
+            hidden_dim=96,
+            num_layers=(2, 2, 6, 2),
+            head_dim=32,
+            patch_size=4,
+            window_size=7,
+            exp_rate=4,
+            attn_drop_prob=0.1,
+            mlp_drop_prob=0.1,
+            # res_drop_prob=0.1,
+        )
+
+
+class SwinS(SwinTransformer):
+    def __init__(self, num_classes=None):
+        super().__init__(
+            num_classes=num_classes,
+            hidden_dim=96,
+            num_layers=(2, 2, 18, 2),
+            head_dim=32,
+            patch_size=4,
+            window_size=7,
+            exp_rate=4,
+            attn_drop_prob=0.1,
+            mlp_drop_prob=0.1,
+            # res_drop_prob=0.1,
+        )
+
+
+class SwinB(SwinTransformer):
+    def __init__(self, num_classes=None):
+        super().__init__(
+            num_classes=num_classes,
+            hidden_dim=128,
+            num_layers=(2, 2, 18, 2),
+            head_dim=32,
+            patch_size=4,
+            window_size=7,
+            exp_rate=4,
+            attn_drop_prob=0.1,
+            mlp_drop_prob=0.1,
+            # res_drop_prob=0.1,
+        )
+
+
+class SwinL(SwinTransformer):
+    def __init__(self, num_classes=None):
+        super().__init__(
+            num_classes=num_classes,
+            hidden_dim=192,
+            num_layers=(2, 2, 18, 2),
+            head_dim=32,
+            patch_size=4,
+            window_size=7,
+            exp_rate=4,
+            attn_drop_prob=0.1,
+            mlp_drop_prob=0.1,
+            # res_drop_prob=0.1,
+        )
 
 
 if __name__ == "__main__":
     model = SwinTransformer(num_classes=100)
-    image = torch.randn((4, 3, 512, 512))
+    # model = SwinS()
+    img_size = 223
+    image = torch.randn((4, 3, img_size, img_size))
     model(image).shape
